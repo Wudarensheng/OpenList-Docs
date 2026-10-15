@@ -123,6 +123,11 @@ After deployment, the first visit to the site automatically enters an **installa
 | `MAX_UPPART` | Optional | `16777216` | Max size (bytes) per chunk in multipart upload |
 | `ASSET_URLS` | Optional | — | Frontend asset CDN base URL, supports the `$version` placeholder |
 | `ALLOW_SEED` | Optional | — | Allowlist of hosts permitted as seed-data sources |
+| `SINGLEFLIGHT` | Optional | `auto` | Concurrent dedup mode: `auto` / `db` / `memory` / `off` |
+| `SINGLEFLIGHT_HANDOFF_MS` | Optional | `1000` | How long (ms) a finished result stays in the table for already-waiting instances |
+| `SINGLEFLIGHT_LOCK_TTL_MS` | Optional | `30000` | Max lock hold time (ms) for the executor; an expired lock can be taken over |
+| `SINGLEFLIGHT_POLL_MS` | Optional | `200` | Poll interval (ms) for waiting instances; below 100 is not recommended |
+| `SINGLEFLIGHT_WAIT_MS` | Optional | `15000` | Max wait (ms) for waiting instances, then they execute themselves |
 :::
 
 ::: zh-CN
@@ -142,6 +147,39 @@ After deployment, the first visit to the site automatically enters an **installa
 | `MAX_UPPART` | 可选 | `16777216` | 分片上传单片大小上限（字节） |
 | `ASSET_URLS` | 可选 | — | 前端静态资源 CDN 地址，支持 `$version` 占位符 |
 | `ALLOW_SEED` | 可选 | — | 允许作为种子数据来源的主机白名单 |
+| `SINGLEFLIGHT` | 可选 | `auto` | 并发去重模式：`auto` / `db` / `memory` / `off` |
+| `SINGLEFLIGHT_HANDOFF_MS` | 可选 | `1000` | 执行完成后结果在表中保留多久（ms），供正在等待的实例读取 |
+| `SINGLEFLIGHT_LOCK_TTL_MS` | 可选 | `30000` | 执行者持锁上限（ms），到期可被其他实例接管 |
+| `SINGLEFLIGHT_POLL_MS` | 可选 | `200` | 等待方轮询间隔（ms），不建议低于 100 |
+| `SINGLEFLIGHT_WAIT_MS` | 可选 | `15000` | 等待方最长等待（ms），超时后自行执行 |
+:::
+
+### Concurrent deduplication (singleflight) { lang="en" }
+
+### 并发去重（singleflight） { lang="zh-CN" }
+
+::: en
+A deployment runs across multiple isolates, so an in-process map alone cannot merge duplicate calls across instances. With singleflight, identical directory listing / metadata requests arriving at the same time trigger only one upstream request, and the others wait and reuse the same result — cutting rate limiting, account bans and CPU timeouts.
+
+- **Two levels**: in-process merge (all modes) + table coordination via `x_singleflight` (`db` mode, across isolates).
+- **Modes** (`SINGLEFLIGHT`, default `auto`): `auto` uses table coordination when a SQL backend (d1 / mysql / do) is available, otherwise in-process; `db` forces the table; `memory` is in-process only; `off` disables dedup entirely.
+- **No result caching**: only calls that observe a running executor on arrival reuse the result, so stale reads (e.g. a deleted file still showing after refresh) cannot happen.
+- **Availability first**: coordination-layer failures degrade to "each caller executes once"; exceptions from the business function itself are rethrown without retry.
+- The `x_singleflight` table is created automatically by the SQL driver and holds runtime data only. Statistics (`executed` / `coalesced` / `shared` / `fallback`) are available in the `singleflight` field of `/api/debug/info`.
+
+See [Environment Variables](/ecosystem/official_worker/guide_env) for details.
+:::
+
+::: zh-CN
+一个部署会同时运行多个 isolate，仅靠进程内的 Map 无法跨实例合并重复调用。启用 singleflight 后，同一时刻相同的目录列表 / 元信息请求只向上游网盘发起一次，其余请求等待并复用同一结果，从而减少限流、封号与 CPU 超时。
+
+- **两级去重**：进程内合并（所有模式）+ 通过 `x_singleflight` 表协调（`db` 模式，跨 isolate）。
+- **模式**（`SINGLEFLIGHT`，默认 `auto`）：`auto` 在有 SQL 库（d1 / mysql / do）时用表协调，否则退回进程内；`db` 强制用表；`memory` 仅进程内；`off` 完全关闭去重。
+- **不做结果缓存**：只有「到达时观察到执行者正在运行」的请求才复用结果，因此不会出现「删除文件后刷新仍看到被删文件」这类脏读。
+- **可用性优先**：协调层异常一律降级为「各自执行一次」；业务函数自身的异常原样抛出且不重试。
+- `x_singleflight` 表由 SQL 驱动自动创建，仅承载运行时数据。运行统计（`executed` / `coalesced` / `shared` / `fallback`）见 `/api/debug/info` 的 `singleflight` 字段。
+
+详见[配置变量](/ecosystem/official_worker/guide_env)。
 :::
 
 ## Data Backend（DB_FORMAT & DB_DRIVER） { lang="en" }

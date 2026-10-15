@@ -149,8 +149,11 @@ When `DB_FORMAT = "sql"`, the TS Worker uses the same table names and schema as 
 | `User`        | `x_users`         |
 | `Meta`        | `x_metas`         |
 | (TS only)     | `x_plugins`       |
+| (TS runtime)  | `x_singleflight`  |
 
 The prefix is fixed to `x_`, matching the Go backend default.
+
+`x_singleflight` is a **runtime table** used for cross-isolate request deduplication (see below). It is created automatically by the SQL driver on initialization, holds no configuration, and is intentionally excluded from the configuration tables — the Go backend has no such table, so sharing a physical database is unaffected.
 :::
 
 :::zh-CN
@@ -164,8 +167,57 @@ The prefix is fixed to `x_`, matching the Go backend default.
 | `User`        | `x_users`         |
 | `Meta`        | `x_metas`         |
 | （仅 TS）     | `x_plugins`       |
+| （TS 运行时） | `x_singleflight`  |
 
 表名前缀固定为 `x_`，与 Go 后端默认值一致。
+
+`x_singleflight` 是用于跨 isolate 请求去重的**运行时表**（见下文）。它由 SQL 驱动在初始化时自动创建，不承载任何配置，并被刻意排除在配置表之外——Go 后端没有这张表，因此不影响共享同一物理数据库。
+:::
+
+## Concurrent Deduplication (singleflight) { lang="en" }
+
+## 并发去重（singleflight） { lang="zh-CN" }
+
+:::en
+A single deployment runs across multiple isolates, so an in-process map alone cannot merge duplicate calls across instances. Every concurrent request for the same directory listing or metadata would then hit the upstream cloud-drive API separately — a major source of rate limiting, account bans and CPU timeouts. OpenList Worker deduplicates these calls at two levels:
+
+| Level               | Mechanism                                                      | Effective when |
+| :------------------ | :------------------------------------------------------------- | :------------- |
+| L1 — in-process     | `Map<key, Promise>` merge                                      | All modes      |
+| L2 — cross-instance | Grab a lock in the `x_singleflight` table and share the result | `db` mode only |
+
+The mode is controlled by `SINGLEFLIGHT` (`auto` / `db` / `memory` / `off`, default `auto`): when a SQL backend (`d1` / `mysql` / `do`) is available the table is used for coordination, otherwise it falls back to in-process merging.
+
+Design notes:
+
+- **Locking without transactions**: `INSERT OR IGNORE` (MySQL: `INSERT IGNORE`) plus a read-back of `owner` to confirm ownership.
+- **Heartbeat renewal**: the executor renews the lock every `lockTtl / 3`; if it crashes, the lock expires and another instance can take it over.
+- **Waiting side**: polls for the result; on timeout it executes the call itself, so requests are never left hanging.
+- **No result caching**: only calls that observe a running executor on arrival reuse the result; a newly arrived call reclaims the old record and re-executes, which rules out stale reads such as "a deleted file still shows up after refresh".
+- **Fault isolation**: exceptions thrown by the business function are rethrown as-is without retry; coordination-layer failures (missing table, DB timeout, non-serializable result, executor crash) all degrade to "each caller executes once", so the business call never fails.
+
+Integration scope: `listItems` / `getItem` in the storage operation layer, with the dedup key `fs.list|<storage.id>:<storage.modified>:<virtualPath>`. One integration therefore covers `/fs/list`, `/fs/get`, `/fs/dir`, search, WebDAV and MCP. Runtime statistics are exposed in the `singleflight` field of `/api/debug/info`.
+:::
+
+:::zh-CN
+一个部署会同时运行多个 isolate，仅靠进程内的 Map 无法跨实例合并重复调用，导致同一目录列表 / 元信息的并发请求各自打一次上游网盘 API——这正是限流、封号、CPU 超时的主要来源。OpenList Worker 对这类调用做两级去重：
+
+| 层级      | 机制                                   | 生效条件     |
+| :-------- | :------------------------------------- | :----------- |
+| L1 进程内 | `Map<key, Promise>` 合并               | 所有模式     |
+| L2 跨实例 | 在 `x_singleflight` 表中抢锁并共享结果 | 仅 `db` 模式 |
+
+模式由 `SINGLEFLIGHT` 控制（`auto` / `db` / `memory` / `off`，默认 `auto`）：有 SQL 库（`d1` / `mysql` / `do`）时用表协调，否则退回进程内合并。
+
+设计要点：
+
+- **不依赖事务抢锁**：`INSERT OR IGNORE`（MySQL 为 `INSERT IGNORE`）+ 回读 `owner` 确认归属。
+- **心跳续租**：执行者按 `lockTtl / 3` 周期续租；崩溃后锁到期，可被其他实例接管。
+- **等待方**：轮询读取结果，超时后自行执行，不会把请求挂死。
+- **不做结果缓存**：只有「到达时观察到执行者正在运行」的调用才复用结果；新到达的调用会回收旧记录并重新执行，因此不会出现「删除文件后刷新仍看到被删文件」这类脏读。
+- **故障隔离**：业务函数抛出的异常原样抛出且不重试；协调层异常（表缺失 / 数据库超时 / 结果不可序列化 / 执行者崩溃）一律降级为「各自执行一次」，业务不会失败。
+
+接入范围：存储操作层的 `listItems` / `getItem`，去重键为 `fs.list|<storage.id>:<storage.modified>:<virtualPath>`。因此一次接入即覆盖 `/fs/list`、`/fs/get`、`/fs/dir`、搜索、WebDAV 与 MCP。运行统计见 `/api/debug/info` 的 `singleflight` 字段。
 :::
 
 ## Project Structure { lang="en" }

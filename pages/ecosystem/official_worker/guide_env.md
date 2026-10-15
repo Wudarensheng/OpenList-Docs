@@ -42,6 +42,26 @@ In addition to `DB_FORMAT` and `DB_DRIVER`, it is strongly recommended to config
 | `ASSET_URLS` | —          | Frontend asset CDN base URL, supports the `$version` placeholder |
 | `ALLOW_SEED` | —          | Allowlist of hosts permitted as seed-data sources                |
 
+#### Concurrent deduplication (singleflight)
+
+When several isolates of the same deployment receive the same read request (directory listing / metadata) at the same time, singleflight issues only one upstream request and lets the others wait and reuse the same result:
+
+| Variable                   | Default | Description                                                                                                                                                      |
+| -------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SINGLEFLIGHT`             | `auto`  | `auto`: table coordination when a SQL backend (d1 / mysql / do) is available, otherwise in-process; `db`: force table; `memory`: in-process only; `off`: disable |
+| `SINGLEFLIGHT_HANDOFF_MS`  | `1000`  | How long (ms) a finished result stays in the table for **already waiting** concurrent instances to read                                                          |
+| `SINGLEFLIGHT_LOCK_TTL_MS` | `30000` | Max lock hold time (ms) for the executor, renewed every 1/3 of the period; an expired lock can be taken over after the executor crashes                          |
+| `SINGLEFLIGHT_POLL_MS`     | `200`   | Poll interval (ms) for waiting instances. Values below 100 are not recommended: every poll is a SELECT on the coordination table                                 |
+| `SINGLEFLIGHT_WAIT_MS`     | `15000` | Max wait (ms) for waiting instances; on timeout they execute the call themselves instead of hanging                                                              |
+
+Notes:
+
+- **Two levels of deduplication**: in-process merge (effective in all modes) + table coordination (`db` mode, effective across isolates).
+- **No result caching**: only requests that observe a running executor on arrival reuse the result; a newly arrived request reclaims the old record and re-executes. Stale reads such as "a deleted file still appears after refresh" therefore cannot happen.
+- **Availability first**: coordination-layer failures (missing table, DB timeout, non-serializable result, executor crash) degrade to "each caller executes once", so the business call never fails; exceptions thrown by the business function itself are rethrown without retry.
+- The `x_singleflight` table is created automatically by the SQL driver on initialization. It holds runtime data only and is not touched when configuration is saved.
+- Runtime statistics (`executed` / `coalesced` / `shared` / `fallback`) are exposed in the `singleflight` field of `/api/debug/info`.
+
 ### Storage format differences
 
 | `DB_FORMAT` | Description                                                                                                                        |
@@ -130,6 +150,26 @@ If you bound MySQL, set the following variables:
 | `MAX_UPPART` | `16777216` | 分片上传单片大小上限（字节）                    |
 | `ASSET_URLS` | —          | 前端静态资源 CDN 地址，支持 `$version` 占位符   |
 | `ALLOW_SEED` | —          | 允许作为种子数据来源的主机白名单                |
+
+#### 并发去重（singleflight）
+
+同一时刻对同一存储、同一路径的重复读请求（目录列表 / 元信息）只向上游发起一次调用，其余并发请求等待并复用同一结果：
+
+| 变量                       | 默认值  | 说明                                                                                                            |
+| -------------------------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `SINGLEFLIGHT`             | `auto`  | `auto`：有 SQL 库（d1 / mysql / do）时用表协调，否则退回进程内；`db`：强制用表；`memory`：仅进程内；`off`：关闭 |
+| `SINGLEFLIGHT_HANDOFF_MS`  | `1000`  | 执行完成后结果在表中保留多久（ms），供**正在等待的**并发实例读取                                                |
+| `SINGLEFLIGHT_LOCK_TTL_MS` | `30000` | 执行者持锁上限（ms），期间按 1/3 周期续租；执行者崩溃后到期可被接管                                             |
+| `SINGLEFLIGHT_POLL_MS`     | `200`   | 等待方轮询间隔（ms）。不建议低于 100：每次轮询都是一次对协调表的 SELECT                                         |
+| `SINGLEFLIGHT_WAIT_MS`     | `15000` | 等待方最长等待（ms），超时后自行执行，避免被慢请求拖死                                                          |
+
+行为要点：
+
+- **两级去重**：进程内合并（所有模式都生效）+ 数据库表协调（`db` 模式，跨 isolate 生效）。
+- **不做结果缓存**：只有「到达时观察到执行者正在运行」的请求才会复用结果；新到达的请求会回收旧记录并重新执行。因此不存在「删除文件后刷新仍看到旧文件」这类脏读。
+- **可用性优先**：表不存在、数据库超时、结果无法序列化、执行者崩溃等**协调层**异常一律降级为「各自执行一次」，业务不会失败；而**业务函数自身的异常会原样抛出且不重试**。
+- `x_singleflight` 表由 SQL 驱动在初始化时自动创建，属运行时数据，不参与配置读写。
+- 运行统计（`executed` / `coalesced` / `shared` / `fallback`）可在 `/api/debug/info` 的 `singleflight` 字段查看。
 
 ### 不同存储格式差异
 

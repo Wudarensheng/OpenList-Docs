@@ -81,6 +81,7 @@ In addition to the real storages above, virtual/functional drivers such as `Loca
 - **Offline tasks**: background task queue for batch operations and async processing.
 - **External interfaces**: expose aggregated storage via WebDAV or S3-compatible protocol for mounting into third-party tools.
 - **MCP service**: provide a Model Context Protocol endpoint that can be integrated and called by AI assistants and other clients.
+- **Concurrent deduplication (singleflight)**: identical directory listing / metadata requests arriving at the same time trigger only one upstream request, and the other requests wait and reuse the same result; since a deployment runs multiple isolates, a database table (`x_singleflight`) coordinates across instances in addition to in-process merging.
   :::
 
 :::zh-CN
@@ -92,6 +93,7 @@ In addition to the real storages above, virtual/functional drivers such as `Loca
 - **离线任务**：后台任务队列，支持批量操作与异步处理。
 - **外部接口**：将聚合存储以 WebDAV 或 S3 兼容协议对外暴露，便于挂载到第三方工具。
 - **MCP 服务**：提供 Model Context Protocol 端点，可被 AI 助手等客户端集成调用。
+- **并发去重（singleflight）**：同一时刻相同的目录列表 / 元信息请求只向上游网盘发起一次，其余请求等待并复用同一结果；一个部署存在多个 isolate，因此除进程内合并外，还会用数据库表 `x_singleflight` 做跨实例协调。
   :::
 
 ### Permission Management { lang="en" }
